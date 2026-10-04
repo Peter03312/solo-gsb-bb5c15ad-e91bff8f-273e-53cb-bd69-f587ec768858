@@ -120,6 +120,21 @@ npm start
 - **明确报错不留部分记录**：未知账号（404 `UNKNOWN_ACCOUNT`）、非执行账号（400 `NOT_OPERATOR`）、当前版没有的岗位（400 `POSITION_NOT_IN_VERSION`）、页面版本过期（409 `VERSION_STALE`）均整体拒绝；
 - 登记提交在**同一事务内**复核当前执行版、代班授权与登记行版本，原有登记请求响应、行版本冲突（409）与时间校验保持兼容。
 
+#### 依赖链跳过（本轮新增）
+
+联排中某项无法执行时，舞监在「现场联排」页点该行「跳过链…」，对**当前执行版**发起跳过：
+
+1. **影响预览**：系统以该项为根，沿已发布的前置关系（from → to）求出**根项及全部可达后继**，以拓扑序列出整条依赖链，逐项展示编号、岗位、计划时段、登记行版本号与当前状态；
+2. **填写非空原因并确认**：原因必填（≤200 字）。确认后将整条依赖链标记为跳过；
+3. **阻断与原子性**：链中任一项（尚未跳过的）**已有实际开始或实际完成**，或**预览所见的登记行版本在确认时已变化**，整次操作**整体拒绝**并列出阻断项（409 `SKIP_BLOCKED` / 409 `VERSION_CONFLICT`，响应逐项给出编号、当前行版本与原因），**不留任何部分标记**；提交的链范围必须与当前版本的闭包完全一致（400 `CHAIN_MISMATCH`），请重新预览后再确认；
+4. **首次跳过的效果**：清除该项的**预计结束**，**保留已发布计划**（计划开始/时长/前置关系冻结不变），并对每个新跳过项记录**操作者（舞监）、时间、原因及触发根项**；
+5. **已跳过项只展示、不重复留痕**：已跳过项再次出现在链中（或以其为根重新操作）时只在预览中展示其既有原因，确认不会写入第二条留痕、行版本也不再变化；
+6. **跳过即终态**：执行账号对跳过项提交登记返回 409 `CUE_SKIPPED`；舞监对跳过项提交更正同样返回 409 `CUE_SKIPPED`（**不得更正其时间**，跳过清除的预计结束也不能通过更正恢复）；
+7. **现场重算规则**：跳过项状态为 `SKIPPED`，**不计入待执行时段**（无重算开始/结束）、**不参与同岗位冲突**，且**不把自己的结束作为后继项的前置约束**（后继只受未跳过前置的实际/预计结束约束），其他项仍按现有前置与登记规则重算；
+8. **版本边界**：**仅当前执行版**可预览与确认（携带 `versionId` 时旧版返回 409 `VERSION_STALE`）；**新发布版不继承跳过状态**（新版全部为空登记）；**旧版回看可见**每行跳过原因、操作者、时间与触发根项；已完成项的交接资格沿用现有约定（跳过项因不可能同时具备实际开始与完成，不进入交接候选）。
+
+页面上：跳过行以紫色「已跳过」徽标与置灰底色展示，重算时段与实际/预计时间列显示「—」，实际开始列附跳过原因标签；舞监可点「跳过原因」回看详情；版本列表新增「已跳过」计数；执行账号的现场页对跳过项只读且无登记按钮。
+
 ### 执行岗位
 
 - 「现场联排」页只能看到当前执行版本，本岗位的行高亮并出现操作按钮：
@@ -129,6 +144,7 @@ npm start
 - **代班识别**：若你被指定为某岗位代班，页面顶部黄色横幅提示「你正在代班岗位…」，该岗位行同样高亮并可登记（自己原有岗位权限保留）；若你的岗位被他人代班，横幅提示登记权已移交，本岗位行显示「已由 XX 代班」且不再出现操作按钮；
 - 非本岗位提示项只读；对非最新（已归档）版本不能登记；
 - 已完成项保留实际时间不再变化；未开始项按前置链重算，**重算开始不早于原计划**；
+- **被舞监标记为跳过的提示项只读展示（紫色「已跳过」），无登记按钮**，跳过项不计入待执行时段与岗位冲突，其后继只按未跳过前置重算；
 - 顺延产生的同岗位时段冲突在页面顶部红色横幅逐条展示，同时相关行标注「已顺延」；
 - 岗位登记可能被舞监按规定更正（见上节），更正与岗位登记共用行版本号，持旧版本提交会被 409 拒绝。
 
@@ -142,6 +158,7 @@ npm start
 - 单条提示项的修改同时校验**行版本号**；
 - 现场登记按「提示项行版本号」校验：两位岗位同时操作同一提示项时，先提交者成功，后提交者收到 409 明确报错并刷新；
 - **舞监更正与岗位登记共用同一条登记行版本号**：任一方更新后行版本 +1，另一方（或持旧页面重复提交）会收到 409 拒绝并被要求刷新，确保更正不能覆盖新登记、新登记也不能覆盖更正。
+- **依赖链跳过同样以链中每项的登记行版本号为乐观锁**：确认必须回传预览所见的每个 `rowVersion`；预览后任一项被登记或更正（行版本推进），整次跳过 409 拒绝；跳过成功后新跳过项行版本 +1（已跳过项不重复更新）。
 
 ## 五、配置项（环境变量）
 
@@ -191,13 +208,15 @@ SESSION_SECRET=your-long-random-secret
 | POST/DELETE | `/api/draft/deps[/:id]` | 舞监 | 前置关系增删（校验草稿版本号） |
 | GET | `/api/publish/handover/preview` | 舞监 | **发布前交接预览**：旧执行版已完成项的交接资格、不合格原因、旧登记行版本；无旧版时列表为空 |
 | POST | `/api/publish` | 舞监 | 发布只读版本；冲突返回 422 并列出冲突项；可带 `handover` 交接选择，资格/版本失效返回 409 `HANDOVER_STALE` |
-| GET | `/api/live` | 已登录 | 当前最新版本的现场重算结果（含每行更正历史 `corrections`、本版代班记录 `deputies`；执行账号另含有效岗位 `myPositions`） |
+| GET | `/api/live` | 已登录 | 当前最新版本的现场重算结果（含每行更正历史 `corrections`、跳过留痕 `skip`、本版代班记录 `deputies`；执行账号另含有效岗位 `myPositions`） |
 | GET | `/api/live/deputies` | 已登录 | 当前执行版代班记录（含已撤销历史）；舞监另返回可选岗位 `positions` 与执行账号 `operators` |
 | POST | `/api/live/deputies` | 舞监 | 启用岗位代班（仅当前执行版）；重复启用 409 `DEPUTY_EXISTS` |
 | POST | `/api/live/deputies/revoke` | 舞监 | 撤销岗位在任代班；无在任代班 409 `NO_ACTIVE_DEPUTY` |
-| POST | `/api/registrations` | 执行岗位 | start / complete / estimate（同一事务内复核当前版、代班授权、行版本号） |
-| POST | `/api/registrations/corrections` | 舞监 | 更正/清除单个登记字段（校验行版本号、仅当前执行版本；级联清除与一致性校验；原子写入更正历史） |
-| GET | `/api/versions` `/api/versions/:id` | 已登录 | 版本列表与历史回看（回看含每行更正历史） |
+| POST | `/api/registrations` | 执行岗位 | start / complete / estimate（同一事务内复核当前版、代班授权、行版本号；已跳过项 409 `CUE_SKIPPED`） |
+| POST | `/api/registrations/corrections` | 舞监 | 更正/清除单个登记字段（校验行版本号、仅当前执行版本；级联清除与一致性校验；原子写入更正历史；已跳过项 409 `CUE_SKIPPED`） |
+| GET | `/api/live/skips/preview` | 舞监 | **依赖链跳过影响预览**（仅当前执行版）：根项及沿前置可达的全部后继、各项行版本、阻断项与已跳过原因 |
+| POST | `/api/live/skips` | 舞监 | **确认跳过整条依赖链**（非空原因 + 预览所见行版本；事务内核验，阻断/版本变化整体拒绝；首跳清除预计结束并留痕，已跳过项不重复留痕） |
+| GET | `/api/versions` `/api/versions/:id` | 已登录 | 版本列表（含 `skipCount`）与历史回看（每行含更正历史 `corrections` 与跳过留痕 `skip`） |
 
 ## 八、登记交接 API 调用示例
 
@@ -373,4 +392,168 @@ curl -b sm.cookie -s -X POST http://localhost:3000/api/live/deputies/revoke \
 | 原岗位账号在代班期间登记 | 403 | `DEPUTY_ACTIVE` |
 
 发布新版后代班不自动延续（新版 `deputies` 为空）；旧版记录通过 `GET /api/versions/:id` 的 `deputies` 字段只读可查。
+
+## 十、依赖链跳过 API 调用示例
+
+以本地默认端口 3000、舞监账号为例（`curl -c/-b` 复用会话 Cookie）。假设第 1 版为当前执行版，示例提示项：`L1 → S1 → S2`，`L1 → P1`，`S1 → L2 → L3`（`cueRef` 即提示项引用，等于发布时的草稿 id）。
+
+### 1. 影响预览：查看以某提示项为根的整条依赖链
+
+```bash
+curl -c sm.cookie -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"sm","password":"sm12345"}'
+
+# 以 S1（cueRef=2）为根：链 = S1、S2、L2、L3
+curl -b sm.cookie -s "http://localhost:3000/api/live/skips/preview?cueRef=2&versionId=1"
+```
+
+响应（链按拓扑序，根项在首；`blockers` 为空表示可确认）：
+
+```json
+{
+  "versionId": 1,
+  "versionNo": 1,
+  "root": { "cueRef": 2, "code": "S1", "title": "开场音乐", "position": "音响" },
+  "chain": [
+    { "cueRef": 2, "code": "S1", "title": "开场音乐", "position": "音响",
+      "plannedStartText": "19:05", "plannedEndText": "19:08",
+      "status": "PENDING", "rowVersion": 1, "alreadySkipped": false,
+      "actualStartText": null, "actualEndText": null, "estimatedEndText": null,
+      "isRoot": true, "skip": null },
+    { "cueRef": 5, "code": "S2", "...": "...", "status": "PENDING", "rowVersion": 1, "isRoot": false, "skip": null },
+    { "cueRef": 4, "code": "L2", "...": "...", "status": "PENDING", "rowVersion": 1, "isRoot": false, "skip": null },
+    { "cueRef": 6, "code": "L3", "...": "...", "status": "PENDING", "rowVersion": 1, "isRoot": false, "skip": null }
+  ],
+  "blockers": [],
+  "canSkip": true,
+  "totalCount": 4,
+  "alreadySkippedCount": 0,
+  "newlySkippedCount": 4
+}
+```
+
+- `blockers` 非空时 `canSkip` 为 `false`，阻断项逐项给出 `reason`（已有实际开始/完成）；
+- 链中已有跳过项时 `alreadySkipped=true`、`status="SKIPPED"`，并在 `skip` 中带既有原因，只展示、不重复留痕；
+- 每个 `chain[].rowVersion` 是确认时必须原样回传的**登记行版本号**。
+
+### 2. 确认跳过整条链
+
+请求体中的 `items` 必须与预览 `chain` 完全一致（同样的 cueRef 集合，行版本取预览所见），`reason` 必填非空（≤200 字）：
+
+```bash
+curl -b sm.cookie -s -X POST http://localhost:3000/api/live/skips \
+  -H 'Content-Type: application/json' -d '{
+    "versionId": 1,
+    "cueRef": 2,
+    "reason": "音响设备故障，后续提示项无法执行",
+    "items": [
+      { "cueRef": 2, "rowVersion": 1 },
+      { "cueRef": 5, "rowVersion": 1 },
+      { "cueRef": 4, "rowVersion": 1 },
+      { "cueRef": 6, "rowVersion": 1 }
+    ]
+  }'
+```
+
+成功响应：`version` 为最新现场负载（`GET /api/live` 同构，`conflicts` 已按规则重算），`skip` 为本次汇总。链中每项的 `status` 变为 `SKIPPED`，`schedStartText/schedEndText` 为 `null`，`estimatedEndText` 为 `null`（预计结束已清除），并带 `skip` 留痕：
+
+```json
+{
+  "version": {
+    "id": 1, "versionNo": 1, "isLatest": true,
+    "cues": [
+      { "code": "S1", "status": "SKIPPED",
+        "plannedStartText": "19:05", "schedStartText": null, "schedEndText": null,
+        "actualStartText": null, "actualEndText": null, "estimatedEndText": null,
+        "rowVer": 2,
+        "skip": { "reason": "音响设备故障，后续提示项无法执行",
+                  "skippedBy": "舞监", "skippedAt": "2026-10-03 20:11:36",
+                  "rootCueRef": 2, "rootCode": "S1" } }
+    ],
+    "conflicts": []
+  },
+  "skip": {
+    "rootCueRef": 2, "rootCode": "S1",
+    "reason": "音响设备故障，后续提示项无法执行",
+    "skippedBy": "舞监",
+    "newlySkippedCount": 4,
+    "alreadySkippedCount": 0,
+    "allAlreadySkipped": false
+  }
+}
+```
+
+- **已发布计划不变**：`plannedStartText`、时长、前置关系仍为发布时冻结值；
+- 链中已跳过项不更新（`newlySkippedCount` 只计首跳项）；整链此前均已跳过时 `allAlreadySkipped=true`、`newlySkippedCount=0`，不写新留痕；
+- 以被跳过项为前置、但本身不在该链闭包内的项，重算时忽略该跳过前置（见下节示例与现场负载）。
+
+### 3. 被阻断或版本变化：整次拒绝，不留部分标记
+
+链中 L3 已被灯光岗位登记实际开始后再确认，返回 409 且**不标记任何一项**：
+
+```json
+HTTP 409
+{
+  "error": "SKIP_BLOCKED",
+  "message": "依赖链中 1 项已有实际开始或完成，本次跳过已整体拒绝，未标记任何项",
+  "items": [
+    { "cueRef": 6, "code": "L3", "currentRowVersion": 2,
+      "reason": "「L3」已有实际开始 19:25，不能跳过" }
+  ]
+}
+```
+
+预览后有人对链中任一项提交了登记或更正（行版本推进），返回：
+
+```json
+HTTP 409
+{
+  "error": "VERSION_CONFLICT",
+  "message": "跳过链中 1 项登记行版本已变化，本次跳过已整体拒绝，请重新预览后再确认",
+  "items": [
+    { "cueRef": 6, "code": "L3", "previewRowVersion": 1, "currentRowVersion": 3,
+      "reason": "「L3」登记行版本已变化（预览时 v1，当前 v3），请重新预览后再确认" }
+  ]
+}
+```
+
+### 4. 跳过后的登记 / 更正 / 重算
+
+```bash
+# 执行账号对跳过项登记 -> 409，不改动任何数据
+curl -b sound.cookie -s -X POST http://localhost:3000/api/registrations \
+  -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":2,"rowVersion":2,"action":"start","time":"20:00"}'
+# {"error":"CUE_SKIPPED","message":"「S1」已被舞监标记为跳过（不再执行），执行岗位不能登记；请刷新页面"}
+
+# 舞监对跳过项更正 -> 409（跳过时间不可更正）
+# {"error":"CUE_SKIPPED","message":"「S1」已被标记为跳过，跳过项的登记时间不可更正（保留已发布计划，仅展示跳过原因）"}
+```
+
+重算影响可直接对照 `GET /api/live`：
+
+- `S1/S2/L2/L3`：`status="SKIPPED"`，无 `schedStart/schedEnd`，不出现在 `conflicts`；
+- `L1`（19:00 实际完成于 19:08）未跳过；其另一个后继 `P1`（道具，前置仅 L1）正常顺延：`schedStartText="19:08"`、`delayed=true`；
+- 跳过前置不约束后继：后继项只取**未跳过前置**的实际/预计结束与自身原计划开始的最大值。
+
+### 5. 新版本不继承、旧版回看
+
+- 发布第 2 版后，新版注册行全部为空（无 `skipped`、无 `skip`），跳过状态不延续；
+- 旧版通过 `GET /api/versions/1` 回看，链中每行仍带 `skip`（原因/操作者/时间/根项），`GET /api/versions` 列表的 `skipCount` 给出每版跳过项数；
+- 对非当前执行版携带旧 `versionId` 调用预览/确认返回 409 `VERSION_STALE`。
+
+### 6. 错误一览（均整体拒绝，不留部分标记/留痕）
+
+| 场景 | 状态码 | error |
+| --- | --- | --- |
+| 非舞监调用预览/确认 | 403 | `FORBIDDEN` |
+| 尚未发布任何版本 | 409 | `NO_LIVE_VERSION` |
+| 页面版本已过期（非当前执行版） | 409 | `VERSION_STALE` |
+| 提示项不在该版本 | 404 | `NOT_FOUND` |
+| 原因空 / 超 200 字 / items 缺项 | 400 | `BAD_INPUT` |
+| 提交链与当前版本闭包不一致（漏项/多项） | 400 | `CHAIN_MISMATCH` |
+| 链中已有实际开始或完成 | 409 | `SKIP_BLOCKED` |
+| 预览所见登记行版本变化 | 409 | `VERSION_CONFLICT`（`items` 逐项列出当前版本） |
+| 执行账号登记跳过项 / 舞监更正跳过项 | 409 | `CUE_SKIPPED` |
 

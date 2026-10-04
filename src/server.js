@@ -9,7 +9,7 @@ const session = require('express-session');
 const { db, getMeta, setMeta } = require('./db');
 const { verifyPassword } = require('./auth');
 const { init } = require('./initdb');
-const { timeToMin, minToTime, validatePlan, computeLive } = require('./scheduling');
+const { timeToMin, minToTime, validatePlan, computeLive, topoAnalyze } = require('./scheduling');
 
 init();
 
@@ -175,11 +175,24 @@ function versionPayload(versionRow) {
   for (const r of regRows) {
     regMap.set(r.cue_ref, {
       actualStart: r.actual_start, actualEnd: r.actual_end,
-      estimatedEnd: r.estimated_end, rowVer: r.row_ver,
+      estimatedEnd: r.estimated_end, skipped: r.skipped === 1,
+      rowVer: r.row_ver,
       updatedBy: r.updated_by, updatedAt: r.updated_at,
       sourceVersionId: r.source_version_id, sourceCueRef: r.source_cue_ref,
     });
   }
+
+  // 依赖链跳过留痕（每项至多一条）：操作者、时间、原因、触发根项
+  const skipMap = new Map();
+  db.prepare(
+    `SELECT cue_ref, root_cue_ref, reason, skipped_by, skipped_at
+     FROM registration_skips WHERE version_id = ?`
+  ).all(versionRow.id).forEach((s) => skipMap.set(s.cue_ref, {
+    rootCueRef: s.root_cue_ref,
+    reason: s.reason,
+    skippedBy: s.skipped_by,
+    skippedAt: s.skipped_at,
+  }));
 
   const live = computeLive(cues, deps, regMap);
   const latestId = (db.prepare('SELECT MAX(version_no) AS m FROM rehearsal_versions').get().m);
@@ -237,6 +250,18 @@ function versionPayload(versionRow) {
       actualEndText: minToTime(c.actualEnd),
       estimatedEndText: minToTime(c.estimatedEnd),
       corrections: corrMap.get(c.id) || [],
+      skip: (() => {
+        const s = skipMap.get(c.id);
+        if (!s) return null;
+        const rootCue = cues.find((x) => x.id === s.rootCueRef);
+        return {
+          reason: s.reason,
+          skippedBy: s.skippedBy,
+          skippedAt: s.skippedAt,
+          rootCueRef: s.rootCueRef,
+          rootCode: rootCue ? rootCue.code : null,
+        };
+      })(),
       handover: (() => {
         const r = regMap.get(c.id);
         if (!r || r.sourceVersionId == null) return null;
@@ -699,13 +724,14 @@ app.get('/api/versions', requireAuth, (req, res, next) => {
       `SELECT v.id, v.version_no, v.note, v.created_at,
               (SELECT COUNT(*) FROM registrations r WHERE r.version_id = v.id
                  AND (r.actual_start IS NOT NULL OR r.actual_end IS NOT NULL OR r.estimated_end IS NOT NULL)) AS reg_count,
+              (SELECT COUNT(*) FROM registrations r WHERE r.version_id = v.id AND r.skipped = 1) AS skip_count,
               (SELECT COUNT(*) FROM published_cues p WHERE p.version_id = v.id) AS cue_count
        FROM rehearsal_versions v ORDER BY v.version_no DESC`
     ).all();
     res.json({
       versions: rows.map((r) => ({
         id: r.id, versionNo: r.version_no, note: r.note,
-        createdAt: r.created_at, regCount: r.reg_count, cueCount: r.cue_count,
+        createdAt: r.created_at, regCount: r.reg_count, skipCount: r.skip_count, cueCount: r.cue_count,
       })),
     });
   } catch (e) { next(e); }
@@ -875,6 +901,11 @@ app.post('/api/registrations', requireAuth, (req, res, next) => {
 
       const reg = db.prepare('SELECT * FROM registrations WHERE version_id=? AND cue_ref=?').get(versionId, cueRef);
       if (!reg) throw new ApiError(404, 'NOT_FOUND', '登记记录不存在');
+      // 已被舞监标记跳过的依赖链项：执行账号不得再登记（预计结束已在跳过时清除，计划保留）
+      if (reg.skipped === 1) {
+        throw new ApiError(409, 'CUE_SKIPPED',
+          `「${pc.code}」已被舞监标记为跳过（不再执行），执行岗位不能登记；请刷新页面`);
+      }
       if (rowVersion !== reg.row_ver) {
         throw new ApiError(409, 'VERSION_CONFLICT',
           `「${pc.code}」登记已被更新：当前行版本 ${reg.row_ver}，提交基于 ${rowVersion}，请刷新后重试`,
@@ -962,6 +993,11 @@ app.post('/api/registrations/corrections', requireSM, (req, res, next) => {
     const result = db.transaction(() => {
       const reg = db.prepare('SELECT * FROM registrations WHERE version_id=? AND cue_ref=?').get(versionId, cueRef);
       if (!reg) throw new ApiError(404, 'NOT_FOUND', '登记记录不存在');
+      // 已跳过项只展示，舞监也不得更正其时间（跳过清除预计结束不可通过更正恢复）
+      if (reg.skipped === 1) {
+        throw new ApiError(409, 'CUE_SKIPPED',
+          `「${pc.code}」已被标记为跳过，跳过项的登记时间不可更正（保留已发布计划，仅展示跳过原因）`);
+      }
       if (rowVersion !== reg.row_ver) {
         throw new ApiError(409, 'VERSION_CONFLICT',
           `「${pc.code}」登记已被更新（岗位可能已提交新登记）：当前行版本 ${reg.row_ver}，提交基于 ${rowVersion}，请刷新后重试`,
@@ -1045,6 +1081,279 @@ app.post('/api/registrations/corrections', requireSM, (req, res, next) => {
     res.json({ version: payload, cascaded: result.cascaded });
   } catch (e) { next(e); }
 });
+
+// ---------- 舞监：依赖链跳过（仅当前执行版） ----------
+
+// 沿前置关系向后求闭包：根项 + 沿 from→to 可达的全部后继
+function successorClosure(versionId, rootRef) {
+  const adj = new Map();
+  db.prepare('SELECT from_ref, to_ref FROM published_deps WHERE version_id = ?')
+    .all(versionId).forEach((d) => {
+      if (!adj.has(d.from_ref)) adj.set(d.from_ref, []);
+      adj.get(d.from_ref).push(d.to_ref);
+    });
+  const seen = new Set([rootRef]);
+  const stack = [rootRef];
+  while (stack.length) {
+    const u = stack.pop();
+    for (const v of adj.get(u) || []) {
+      if (!seen.has(v)) { seen.add(v); stack.push(v); }
+    }
+  }
+  return seen;
+}
+
+// 当前执行版（不存在则 409）；请求可携带 versionId 防止旧页面误操作新版本
+function currentLiveVersionForSkip(bodyOrQuery) {
+  const ver = latestPublishedVersion();
+  if (!ver) throw new ApiError(409, 'NO_LIVE_VERSION', '尚未发布任何联排版本，无法执行跳过');
+  const vid = bodyOrQuery?.versionId;
+  if (vid !== undefined && vid !== null && Number(vid) !== ver.id) {
+    throw new ApiError(409, 'VERSION_STALE',
+      `页面基于的联排版本已不是当前执行版（当前为第 ${ver.version_no} 版），请刷新后再操作`,
+      { currentVersionId: ver.id, currentVersionNo: ver.version_no });
+  }
+  return ver;
+}
+
+function regStatusOf(reg) {
+  if (reg.skipped === 1) return 'SKIPPED';
+  if (reg.actual_end !== null) return 'DONE';
+  if (reg.actual_start !== null) return 'RUNNING';
+  return 'PENDING';
+}
+
+// 依赖链跳过预览：根项及其沿前置关系可达的全部后继；逐项给出状态与行版本，
+// 已有实际开始/完成的非跳过项列为阻断项；已跳过项只展示（含原因），不重复留痕。
+function buildSkipPreview(ver, cueRef) {
+  const pc = db.prepare('SELECT * FROM published_cues WHERE version_id=? AND cue_ref=?')
+    .get(ver.id, cueRef);
+  if (!pc) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于当前执行版本');
+
+  const closure = successorClosure(ver.id, cueRef);
+  // 以拓扑序展示依赖链（根在前、后继在后）
+  const cueRows = [...publishedCueMap(ver.id).values()].map((c) => ({
+    id: c.cue_ref, code: c.code, title: c.title, position: c.position,
+    plannedStart: c.planned_start, duration: c.duration,
+  }));
+  const depRows = db.prepare('SELECT from_ref, to_ref FROM published_deps WHERE version_id = ?')
+    .all(ver.id).map((d) => ({ from: d.from_ref, to: d.to_ref }));
+  const { order } = topoAnalyze(cueRows, depRows);
+  const ordered = (order || [...closure]).filter((r) => closure.has(r));
+
+  const regStmt = db.prepare('SELECT * FROM registrations WHERE version_id=? AND cue_ref=?');
+  const cueMap = publishedCueMap(ver.id);
+  const skipRows = db.prepare(
+    'SELECT cue_ref, root_cue_ref, reason, skipped_by, skipped_at FROM registration_skips WHERE version_id = ?'
+  ).all(ver.id);
+  const skipInfo = new Map(skipRows.map((s) => [s.cue_ref, s]));
+
+  const chain = [];
+  const blockers = [];
+  let alreadySkippedCount = 0;
+  for (const ref of ordered) {
+    const cue = cueMap.get(ref);
+    const reg = regStmt.get(ver.id, ref);
+    if (!cue || !reg) {
+      throw new ApiError(500, 'INTERNAL', `提示项引用 ${ref} 的发布/登记数据缺失`);
+    }
+    const status = regStatusOf(reg);
+    const s = skipInfo.get(ref);
+    const item = {
+      cueRef: ref,
+      code: cue.code,
+      title: cue.title,
+      position: cue.position,
+      plannedStartText: minToTime(cue.planned_start),
+      plannedEndText: minToTime(cue.planned_start + cue.duration),
+      status,
+      rowVersion: reg.row_ver,
+      alreadySkipped: status === 'SKIPPED',
+      actualStartText: minToTime(reg.actual_start),
+      actualEndText: minToTime(reg.actual_end),
+      estimatedEndText: minToTime(reg.estimated_end),
+      isRoot: ref === cueRef,
+      skip: s ? {
+        reason: s.reason,
+        skippedBy: s.skipped_by,
+        skippedAt: s.skipped_at,
+        rootCode: (cueMap.get(s.root_cue_ref) || {}).code || null,
+      } : null,
+    };
+    chain.push(item);
+    if (status === 'SKIPPED') {
+      alreadySkippedCount += 1;
+    } else if (reg.actual_start !== null || reg.actual_end !== null) {
+      const what = reg.actual_end !== null
+        ? `已有实际开始 ${minToTime(reg.actual_start)}、实际完成 ${minToTime(reg.actual_end)}`
+        : `已有实际开始 ${minToTime(reg.actual_start)}`;
+      blockers.push({
+        cueRef: ref,
+        code: cue.code,
+        status,
+        currentRowVersion: reg.row_ver,
+        reason: `「${cue.code}」${what}，不能跳过（链中任一项已有实际开始或完成，整次操作将被拒绝）`,
+      });
+    }
+  }
+
+  return {
+    versionId: ver.id,
+    versionNo: ver.version_no,
+    root: { cueRef: cueRef, code: pc.code, title: pc.title, position: pc.position },
+    chain,
+    blockers,
+    canSkip: blockers.length === 0,
+    totalCount: chain.length,
+    alreadySkippedCount,
+    newlySkippedCount: chain.length - alreadySkippedCount - blockers.length,
+  };
+}
+
+// 跳过影响预览（舞监，仅当前执行版）
+app.get('/api/live/skips/preview', requireSM, (req, res, next) => {
+  try {
+    const ver = currentLiveVersionForSkip(req.query);
+    const cueRef = Number(req.query.cueRef);
+    if (!Number.isInteger(cueRef)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的提示项引用 cueRef');
+    res.json(buildSkipPreview(ver, cueRef));
+  } catch (e) { next(e); }
+});
+
+// 确认跳过：同一事务内核验当前执行版、整条链范围、每个登记行版本、阻断状态；
+// 任一不通过整体拒绝，不留部分标记。首次跳过清除预计结束、保留已发布计划并留痕；
+// 已跳过项只展示、不重复留痕。
+app.post('/api/live/skips', requireSM, (req, res, next) => {
+  try {
+    const cueRef = Number(req.body.cueRef);
+    const reason = String(req.body.reason || '').trim();
+    if (!Number.isInteger(cueRef)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的提示项引用 cueRef');
+    if (!reason) throw new ApiError(400, 'BAD_INPUT', '请填写跳过原因（不能为空）');
+    if (reason.length > 200) throw new ApiError(400, 'BAD_INPUT', '跳过原因不能超过 200 字');
+    const rawItems = req.body.items;
+    if (!Array.isArray(rawItems) || rawItems.length === 0) {
+      throw new ApiError(400, 'BAD_INPUT', '请基于预览所见的整条依赖链提交 items: [{cueRef, rowVersion}]');
+    }
+    const submitted = new Map();
+    for (const it of rawItems) {
+      const ref = Number(it?.cueRef);
+      const rv = Number(it?.rowVersion);
+      if (!Number.isInteger(ref) || !Number.isInteger(rv)) {
+        throw new ApiError(400, 'BAD_INPUT', '跳过链每项须包含整数 cueRef 与 rowVersion，请重新预览后再确认');
+      }
+      if (submitted.has(ref)) throw new ApiError(400, 'BAD_INPUT', `跳过链中提示项引用 ${ref} 重复`);
+      submitted.set(ref, rv);
+    }
+
+    const ver = db.transaction(() => {
+      const v = currentLiveVersionForSkip(req.body);
+      const pc = db.prepare('SELECT 1 FROM published_cues WHERE version_id=? AND cue_ref=?').get(v.id, cueRef);
+      if (!pc) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于当前执行版本');
+
+      const closure = successorClosure(v.id, cueRef);
+
+      // 提交范围必须与预览的整条依赖链（根 + 全部可达后继）一致，防止漏项或多项
+      const missing = [...closure].filter((r) => !submitted.has(r));
+      const extra = [...submitted.keys()].filter((r) => !closure.has(r));
+      if (missing.length || extra.length) {
+        const parts = [];
+        if (missing.length) parts.push(`缺少链中提示项引用 ${missing.join(', ')}`);
+        if (extra.length) parts.push(`存在链外提示项引用 ${extra.join(', ')}`);
+        throw new ApiError(400, 'CHAIN_MISMATCH',
+          `提交的依赖链与当前版本不一致（${parts.join('；')}），请重新预览后再确认`);
+      }
+
+      const cueMap = publishedCueMap(v.id);
+      const regStmt = db.prepare('SELECT * FROM registrations WHERE version_id=? AND cue_ref=?');
+
+      // 1) 预览所见登记行版本变化 → 整次拒绝（含已跳过项的行版本）
+      const stale = [];
+      for (const [ref, rv] of submitted) {
+        const reg = regStmt.get(v.id, ref);
+        if (!reg) throw new ApiError(404, 'NOT_FOUND', '登记记录不存在');
+        if (rv !== reg.row_ver) {
+          stale.push({
+            cueRef: ref,
+            code: cueMap.get(ref)?.code ?? null,
+            previewRowVersion: rv,
+            currentRowVersion: reg.row_ver,
+            reason: `「${cueMap.get(ref)?.code || ref}」登记行版本已变化（预览时 v${rv}，当前 v${reg.row_ver}），请重新预览后再确认`,
+          });
+        }
+      }
+      if (stale.length) {
+        throw new ApiError(409, 'VERSION_CONFLICT',
+          `跳过链中 ${stale.length} 项登记行版本已变化，本次跳过已整体拒绝，请重新预览后再确认`,
+          { items: stale });
+      }
+
+      // 2) 链中任一项（非已跳过）已有实际开始或完成 → 整次拒绝并列出阻断项
+      const blockers = [];
+      for (const ref of closure) {
+        const reg = regStmt.get(v.id, ref);
+        if (reg.skipped === 1) continue; // 已跳过项只展示、不重复留痕
+        if (reg.actual_start !== null || reg.actual_end !== null) {
+          const cue = cueMap.get(ref);
+          const what = reg.actual_end !== null
+            ? `已有实际开始 ${minToTime(reg.actual_start)}、实际完成 ${minToTime(reg.actual_end)}`
+            : `已有实际开始 ${minToTime(reg.actual_start)}`;
+          blockers.push({
+            cueRef: ref,
+            code: cue.code,
+            currentRowVersion: reg.row_ver,
+            reason: `「${cue.code}」${what}，不能跳过`,
+          });
+        }
+      }
+      if (blockers.length) {
+        throw new ApiError(409, 'SKIP_BLOCKED',
+          `依赖链中 ${blockers.length} 项已有实际开始或完成，本次跳过已整体拒绝，未标记任何项`,
+          { items: blockers });
+      }
+
+      // 3) 全部校验通过：仅对未跳过项首跳留痕——清除预计结束，保留已发布计划
+      const stamp = new Date().toLocaleString('sv-SE'); // YYYY-MM-DD HH:MM:SS
+      const actor = req.session.user.displayName;
+      const upd = db.prepare(
+        `UPDATE registrations SET skipped = 1, estimated_end = NULL,
+           row_ver = row_ver + 1, updated_by = @by, updated_at = @at
+         WHERE version_id = @vid AND cue_ref = @ref AND skipped = 0`
+      );
+      const ins = db.prepare(
+        `INSERT INTO registration_skips(version_id, cue_ref, root_cue_ref, reason, skipped_by, skipped_at)
+         VALUES (@vid, @ref, @root, @reason, @by, @at)`
+      );
+      let newlySkipped = 0;
+      for (const ref of closure) {
+        const info = upd.run({ vid: v.id, ref, by: actor, at: stamp });
+        if (info.changes === 1) {
+          ins.run({ vid: v.id, ref, root: cueRef, reason, by: actor, at: stamp });
+          newlySkipped += 1;
+        }
+      }
+      return { ver: v, newlySkipped };
+    })();
+
+    const payload = versionPayload(ver.ver);
+    res.json({
+      version: payload,
+      skip: {
+        rootCueRef: cueRef,
+        rootCode: publishedCueMap(ver.ver.id).get(cueRef)?.code ?? null,
+        reason,
+        skippedBy: req.session.user.displayName,
+        newlySkippedCount: ver.newlySkipped,
+        alreadySkippedCount: closureSizeFor(ver.ver.id, cueRef) - ver.newlySkipped,
+        allAlreadySkipped: ver.newlySkipped === 0,
+      },
+    });
+  } catch (e) { next(e); }
+});
+
+// 链大小（仅响应汇总用）
+function closureSizeFor(versionId, rootRef) {
+  return successorClosure(versionId, rootRef).size;
+}
 
 // ---------- 静态页面与错误处理 ----------
 

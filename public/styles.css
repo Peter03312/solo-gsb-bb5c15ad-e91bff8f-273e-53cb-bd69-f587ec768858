@@ -41,6 +41,8 @@ button.primary { background: #2f6fed; color: #fff; }
 button.primary:hover { background: #245bcc; }
 button.danger { background: #c0392b; color: #fff; }
 button.danger:hover { background: #a33224; }
+button.warn { background: #7a52b8; color: #fff; }
+button.warn:hover { background: #65419c; }
 button.ghost { background: #eef1f5; color: #334; border-color: #d3d9e2; }
 button.ghost:hover { background: #e2e7ee; }
 button.tiny { padding: 3px 10px; font-size: 12px; margin-right: 4px; }
@@ -65,6 +67,7 @@ tr:hover td { background: #fafbfd; }
 .badge.pending { background: #eef1f5; color: #556; }
 .badge.running { background: #fff3df; color: #9a6200; }
 .badge.done { background: #e2f5e9; color: #1d7a43; }
+.badge.skipped { background: #ece7f5; color: #5b3a9a; }
 .delayed { color: #c0392b; font-weight: 700; }
 
 .val-ok { background: #e9f8ef; border: 1px solid #b6e2c6; color: #1d7a43; padding: 10px 14px; border-radius: 8px; }
@@ -96,6 +99,21 @@ tr.ho-ineligible td { background: #fdf7f6; }
 .ho-reasons li { margin: 2px 0; white-space: normal; }
 .ho-stale { color: #c0392b; }
 .handover-tag { display: inline-block; margin-top: 2px; font-size: 11px; color: #1d6f52; background: #e2f5ee; border-radius: 6px; padding: 0 6px; white-space: nowrap; }
+
+/* 依赖链跳过 */
+.skip-tag { margin-top: 2px; font-size: 11px; color: #5b3a9a; background: #ece7f5; border-radius: 6px; padding: 1px 6px; white-space: normal; display: inline-block; }
+.skip-count { color: #5b3a9a; font-weight: 700; }
+tr.skipped-row td { background: #f6f3fb; color: #8a8299; }
+tr.skipped-row:hover td { background: #efe9f8; }
+tr.skipped-row td strong { color: #5b3a9a; }
+.skip-chain-wrap td, .skip-chain-wrap th { font-size: 12px; vertical-align: top; }
+.skip-chain-wrap tr.chain-root td { background: #f1ecfa; }
+.skip-chain-wrap tr.chain-skipped td { background: #f6f3fb; }
+.skip-chain-wrap .skip-tag { margin-top: 2px; }
+.skip-view { display: flex; flex-direction: column; gap: 10px; font-size: 13px; }
+.skip-reason-box { margin-top: 4px; background: #f6f3fb; border: 1px solid #d8cfec; border-radius: 8px; padding: 8px 10px; color: #4a3473; white-space: pre-wrap; }
+#skip-form { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+#skip-form textarea { padding: 8px 10px; border: 1px solid #cbd2dc; border-radius: 8px; font-size: 13px; font-family: inherit; resize: vertical; }
 .reg-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .reg-actions input[type="time"] { width: 92px; padding: 5px 8px; }
 .own-row td { background: #f3f8ff; }

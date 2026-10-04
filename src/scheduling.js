@@ -163,8 +163,10 @@ function validatePlan(cues, deps) {
  * 现场联排：结合登记的实际/预计时间重算尚未开始项。
  * publishedCues: [{id(=cueRef), code, title, position, plannedStart, duration}]
  * deps: [{from, to}]（以 cueRef 表示）
- * regs: Map/object keyed by cueRef -> {actualStart, actualEnd, estimatedEnd, rowVer, updatedBy, updatedAt}
+ * regs: Map/object keyed by cueRef -> {actualStart, actualEnd, estimatedEnd, skipped, rowVer, updatedBy, updatedAt}
  *
+ * 舞监标记为跳过的项：状态 SKIPPED，不产生待执行时段，不参与前置顺延与岗位冲突，
+ * 其他项仍按现有前置与登记规则重算。
  * 返回 { cues: [...], conflicts: [{position,a,b,message}], orderProblem: null|message }
  */
 function computeLive(publishedCues, deps, regMap) {
@@ -191,10 +193,16 @@ function computeLive(publishedCues, deps, regMap) {
     const as = r.actualStart ?? null;
     const ae = r.actualEnd ?? null;
     const ee = r.estimatedEnd ?? null;
+    const skipped = r.skipped === true || r.skipped === 1;
 
     let status, schedStart, schedEnd, effStart;
 
-    if (ae !== null) {
+    if (skipped) {
+      // 已跳过：只展示，不产生待执行时段；其前置约束对后项不再生效（前置不可执行导致本项一同跳过）
+      status = 'SKIPPED';
+      schedStart = null;
+      schedEnd = null;
+    } else if (ae !== null) {
       status = 'DONE';
       schedStart = as;
       schedEnd = ae;
@@ -207,7 +215,8 @@ function computeLive(publishedCues, deps, regMap) {
       let start = cue.plannedStart; // 开始时刻不得早于原计划
       for (const p of preds.get(id)) {
         const pc = calc.get(p);
-        if (pc) start = Math.max(start, pc.schedEnd);
+        // 已跳过的前置不计入待执行时段：不约束后项开始
+        if (pc && pc.status !== 'SKIPPED') start = Math.max(start, pc.schedEnd);
       }
       effStart = start;
       schedStart = start;
@@ -220,6 +229,7 @@ function computeLive(publishedCues, deps, regMap) {
       actualStart: as,
       actualEnd: ae,
       estimatedEnd: ee,
+      skipped,
       schedStart,
       schedEnd,
       delayed: status === 'PENDING' && schedStart > cue.plannedStart,
@@ -229,10 +239,11 @@ function computeLive(publishedCues, deps, regMap) {
     });
   }
 
-  // 顺延之后的岗位冲突：至少一方未完成
+  // 顺延之后的岗位冲突：跳过项不计入，且至少一方未完成
   const conflicts = [];
   const byPosition = new Map();
   for (const c of calc.values()) {
+    if (c.status === 'SKIPPED') continue;
     if (!byPosition.has(c.position)) byPosition.set(c.position, []);
     byPosition.get(c.position).push(c);
   }

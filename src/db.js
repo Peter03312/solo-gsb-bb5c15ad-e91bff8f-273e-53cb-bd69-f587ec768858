@@ -85,11 +85,24 @@ CREATE TABLE IF NOT EXISTS registrations (
   actual_start   INTEGER,                   -- 实际开始（分钟）
   actual_end     INTEGER,                   -- 实际完成（分钟）
   estimated_end  INTEGER,                   -- 预计结束（分钟）
+  skipped        INTEGER NOT NULL DEFAULT 0,-- 1：舞监已将该项标记为跳过（依赖链不可执行）
   row_ver        INTEGER NOT NULL DEFAULT 1,
   updated_by     TEXT,
   updated_at     TEXT,
   source_version_id INTEGER,                -- 发布交接：实际时间延续自哪个旧执行版
   source_cue_ref    INTEGER,                -- 发布交接：延续自旧版的哪个提示项引用
+  UNIQUE(version_id, cue_ref)
+);
+
+-- 依赖链跳过留痕：每个版本每项至多一条（已跳过项再次出现在链中只展示、不重复留痕）
+CREATE TABLE IF NOT EXISTS registration_skips (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id     INTEGER NOT NULL REFERENCES rehearsal_versions(id) ON DELETE CASCADE,
+  cue_ref        INTEGER NOT NULL,          -- 被跳过的提示项引用
+  root_cue_ref   INTEGER NOT NULL,          -- 触发本次操作的根提示项（沿其后继传播）
+  reason         TEXT NOT NULL,             -- 非空原因
+  skipped_by     TEXT NOT NULL,             -- 操作者（舞监）
+  skipped_at     TEXT NOT NULL,             -- 操作时间
   UNIQUE(version_id, cue_ref)
 );
 
@@ -127,6 +140,7 @@ CREATE INDEX IF NOT EXISTS idx_pcues_version ON published_cues(version_id);
 CREATE INDEX IF NOT EXISTS idx_reg_version ON registrations(version_id);
 CREATE INDEX IF NOT EXISTS idx_corr_version ON registration_corrections(version_id);
 CREATE INDEX IF NOT EXISTS idx_deputies_version ON position_deputies(version_id);
+CREATE INDEX IF NOT EXISTS idx_skips_version ON registration_skips(version_id);
 -- 每个版本每个岗位至多一名在任代班（部分唯一索引）
 CREATE UNIQUE INDEX IF NOT EXISTS idx_deputies_active
   ON position_deputies(version_id, position) WHERE active = 1;
@@ -141,6 +155,8 @@ ensureColumn('registrations', 'source_version_id',
   'ALTER TABLE registrations ADD COLUMN source_version_id INTEGER');
 ensureColumn('registrations', 'source_cue_ref',
   'ALTER TABLE registrations ADD COLUMN source_cue_ref INTEGER');
+ensureColumn('registrations', 'skipped',
+  'ALTER TABLE registrations ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0');
 
 function getMeta(key, fallback = null) {
   const row = db.prepare('SELECT value FROM meta WHERE key = ?').get(key);
