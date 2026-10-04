@@ -123,10 +123,23 @@ CREATE TABLE IF NOT EXISTS position_deputies (
   revoked_at     TEXT
 );
 
+-- 现场跳过：联排中某项无法执行时，舞监对当前执行版沿前置依赖可达的整条链标记跳过
+-- （每个版本每项至多一条：确认时已跳过项只展示、不重复留痕；发布新版本不继承）
+CREATE TABLE IF NOT EXISTS cue_skips (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id     INTEGER NOT NULL REFERENCES rehearsal_versions(id) ON DELETE CASCADE,
+  cue_ref        INTEGER NOT NULL,
+  reason         TEXT NOT NULL,            -- 非空跳过原因（整链同一次操作共用）
+  skipped_by     TEXT NOT NULL,            -- 操作者（舞监显示名）
+  skipped_at     TEXT NOT NULL,            -- 操作时间
+  UNIQUE(version_id, cue_ref)
+);
+
 CREATE INDEX IF NOT EXISTS idx_pcues_version ON published_cues(version_id);
 CREATE INDEX IF NOT EXISTS idx_reg_version ON registrations(version_id);
 CREATE INDEX IF NOT EXISTS idx_corr_version ON registration_corrections(version_id);
 CREATE INDEX IF NOT EXISTS idx_deputies_version ON position_deputies(version_id);
+CREATE INDEX IF NOT EXISTS idx_skips_version ON cue_skips(version_id);
 -- 每个版本每个岗位至多一名在任代班（部分唯一索引）
 CREATE UNIQUE INDEX IF NOT EXISTS idx_deputies_active
   ON position_deputies(version_id, position) WHERE active = 1;

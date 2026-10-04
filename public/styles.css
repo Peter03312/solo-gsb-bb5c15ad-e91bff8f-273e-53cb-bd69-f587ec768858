@@ -65,7 +65,17 @@ tr:hover td { background: #fafbfd; }
 .badge.pending { background: #eef1f5; color: #556; }
 .badge.running { background: #fff3df; color: #9a6200; }
 .badge.done { background: #e2f5e9; color: #1d7a43; }
+.badge.skipped { background: #ececf1; color: #5a5a6e; border: 1px solid #d3d3de; }
 .delayed { color: #c0392b; font-weight: 700; }
+
+/* 跳过依赖链 */
+.skipped-row td { background: #f6f6f9 !important; color: #8a8a99; }
+.skipped-row:hover td { background: #eeeeF2 !important; }
+.skip-tag { margin-top: 3px; font-size: 11px; color: #5a5a6e; background: #ececf1; border-radius: 6px; padding: 1px 6px; white-space: normal; line-height: 1.5; }
+.skip-chain-wrap td, .skip-chain-wrap th { font-size: 12px; vertical-align: top; }
+tr.skip-row-new td { background: #f4faf6; }
+tr.skip-row-done td { background: #f6f6f9; }
+tr.skip-row-block td { background: #fdf7f6; }
 
 .val-ok { background: #e9f8ef; border: 1px solid #b6e2c6; color: #1d7a43; padding: 10px 14px; border-radius: 8px; }
 .val-err { background: #fdecea; border: 1px solid #f3b6ae; color: #a33224; padding: 10px 14px; border-radius: 8px; }

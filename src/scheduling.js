@@ -163,7 +163,10 @@ function validatePlan(cues, deps) {
  * 现场联排：结合登记的实际/预计时间重算尚未开始项。
  * publishedCues: [{id(=cueRef), code, title, position, plannedStart, duration}]
  * deps: [{from, to}]（以 cueRef 表示）
- * regs: Map/object keyed by cueRef -> {actualStart, actualEnd, estimatedEnd, rowVer, updatedBy, updatedAt}
+ * regs: Map/object keyed by cueRef -> {actualStart, actualEnd, estimatedEnd, rowVer, updatedBy, updatedAt, skipped}
+ *
+ * 已标记跳过的提示项：独立状态 SKIPPED（展示用，沿用计划时刻），不约束其后继，
+ * 且不参与顺延开始计算与岗位冲突（不计入待执行时段）；其他项仍按现有前置与登记规则重算。
  *
  * 返回 { cues: [...], conflicts: [{position,a,b,message}], orderProblem: null|message }
  */
@@ -192,6 +195,25 @@ function computeLive(publishedCues, deps, regMap) {
     const ae = r.actualEnd ?? null;
     const ee = r.estimatedEnd ?? null;
 
+    // 已跳过项：跳过标记由整链事务保证闭包（其所有后继同样跳过），此处对被跳过前置再做一次防御性忽略
+    if (r.skipped) {
+      calc.set(id, {
+        ...cue,
+        status: 'SKIPPED',
+        actualStart: as,
+        actualEnd: ae,
+        estimatedEnd: ee,
+        schedStart: cue.plannedStart,
+        schedEnd: cue.plannedStart + cue.duration,
+        delayed: false,
+        rowVer: r.rowVer ?? 1,
+        updatedBy: r.updatedBy ?? null,
+        updatedAt: r.updatedAt ?? null,
+        skip: r.skipped,
+      });
+      continue;
+    }
+
     let status, schedStart, schedEnd, effStart;
 
     if (ae !== null) {
@@ -207,7 +229,9 @@ function computeLive(publishedCues, deps, regMap) {
       let start = cue.plannedStart; // 开始时刻不得早于原计划
       for (const p of preds.get(id)) {
         const pc = calc.get(p);
-        if (pc) start = Math.max(start, pc.schedEnd);
+        // 跳过的前置不计入待执行时段，不约束后项开始（跳过按整链闭包写入，此处为防御）
+        if (!pc || pc.status === 'SKIPPED') continue;
+        start = Math.max(start, pc.schedEnd);
       }
       effStart = start;
       schedStart = start;
@@ -226,13 +250,15 @@ function computeLive(publishedCues, deps, regMap) {
       rowVer: r.rowVer ?? 1,
       updatedBy: r.updatedBy ?? null,
       updatedAt: r.updatedAt ?? null,
+      skip: null,
     });
   }
 
-  // 顺延之后的岗位冲突：至少一方未完成
+  // 顺延之后的岗位冲突：至少一方未完成；跳过项不计入待执行时段，不参与冲突
   const conflicts = [];
   const byPosition = new Map();
   for (const c of calc.values()) {
+    if (c.status === 'SKIPPED') continue;
     if (!byPosition.has(c.position)) byPosition.set(c.position, []);
     byPosition.get(c.position).push(c);
   }

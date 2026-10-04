@@ -471,7 +471,16 @@ async function loadLive() {
 function statusBadge(s) {
   if (s === 'DONE') return '<span class="badge done">已完成</span>';
   if (s === 'RUNNING') return '<span class="badge running">已开始</span>';
+  if (s === 'SKIPPED') return '<span class="badge skipped">已跳过</span>';
   return '<span class="badge pending">未开始</span>';
+}
+
+// 跳过标注：操作者、时间、原因（现场与旧版回看均只读展示；已跳过项不重复留痕）
+function skipTag(c) {
+  if (!c.skip) return '';
+  return `<div class="skip-tag" title="跳过原因：${esc(c.skip.reason)}｜${esc(c.skip.skippedBy)} 于 ${esc(c.skip.skippedAt)}">
+    ⛔ 已跳过 · ${esc(c.skip.skippedBy)} · ${esc(c.skip.skippedAt)}
+  </div>`;
 }
 
 function renderConflicts(conflicts) {
@@ -512,9 +521,13 @@ function renderLive() {
 
   $('#live-tbody').innerHTML = v.cues.map((c) => {
     const mine = isOp && myPositions.includes(c.position);
+    const skipped = c.status === 'SKIPPED';
     const delayed = c.delayed ? `<div class="delayed">已顺延</div>` : '';
     let reg = '<span class="muted">—</span>';
-    if (canReg && mine) {
+    if (skipped) {
+      // 已跳过：执行账号不得再登记；舞监不得更正其时间，只展示原因
+      reg = '<span class="muted">已跳过<br>不可登记/更正</span>';
+    } else if (canReg && mine) {
       reg = renderRegControls(c);
     } else if (mine && isOp) {
       reg = '<span class="muted">本岗位（版本已归档）</span>';
@@ -522,16 +535,16 @@ function renderLive() {
       const d = activeDepByPos.get(c.position);
       reg = `<span class="muted">已由 ${esc(d.deputyDisplayName)} 代班</span>`;
     } else if (isSM) {
-      reg = renderCorrectionCell(c, v, 'live');
+      reg = renderSMCell(c, v);
     }
-    return `<tr class="${mine ? 'own-row' : ''}" data-cue="${c.id}">
+    return `<tr class="${mine ? 'own-row' : ''} ${skipped ? 'skipped-row' : ''}" data-cue="${c.id}">
       <td><strong>${esc(c.code)}</strong></td>
       <td>${esc(c.title)}</td>
       <td>${esc(c.position)}${deputyPosTag(activeDepByPos.get(c.position))}</td>
       <td class="mono">${c.plannedStartText} - ${minText(c.plannedStart + c.duration)}</td>
       <td class="mono">${c.schedStartText}${delayed}</td>
       <td class="mono">${c.schedEndText}</td>
-      <td>${statusBadge(c.status)}<div class="muted">v${c.rowVer}</div></td>
+      <td>${statusBadge(c.status)}<div class="muted">v${c.rowVer}</div>${skipTag(c)}</td>
       <td class="mono">${c.actualStartText ?? '—'}${handoverTag(c)}</td>
       <td class="mono">${c.actualEndText ?? '—'}</td>
       <td class="mono">${c.estimatedEndText ?? '—'}</td>
@@ -711,6 +724,21 @@ function renderCorrectionCell(c, v, scope) {
   return `<div class="corr-actions">${corrBtn}${histBtn}</div>`;
 }
 
+// 舞监在当前执行版可发起跳过：入口在每行操作列（已跳过/归档版本不提供）
+function renderSMCell(c, v) {
+  if (!v.isLatest) {
+    return '<span class="muted">归档版本<br>不可操作</span>';
+  }
+  if (c.status === 'SKIPPED') {
+    return '<span class="muted">已跳过<br>不可更正</span>';
+  }
+  return `<div class="corr-actions">
+    <button class="danger tiny" data-act="open-correct" data-scope="live" data-cue="${c.id}">更正</button>
+    <button class="ghost tiny" data-act="open-skip" data-cue="${c.id}">跳过依赖链</button>
+    ${c.corrections?.length ? `<button class="ghost tiny" data-act="open-history" data-scope="live" data-cue="${c.id}">更正记录(${c.corrections.length})</button>` : ''}
+  </div>`;
+}
+
 function openModal(title, html) {
   $('#modal-title').textContent = title;
   $('#modal-body').innerHTML = html;
@@ -757,15 +785,171 @@ function renderHistoryHtml(cue, v) {
 }
 
 $('#live-tbody').addEventListener('click', (ev) => {
-  const corrBtn = ev.target.closest('button[data-act="open-correct"], button[data-act="open-history"]');
+  const corrBtn = ev.target.closest('button[data-act="open-correct"], button[data-act="open-history"], button[data-act="open-skip"]');
   if (!corrBtn) return;
   const cueId = Number(corrBtn.dataset.cue);
   const { v, cue } = findCueInContext('live', cueId);
   if (!cue) return;
   if (corrBtn.dataset.act === 'open-history') {
     openModal(`更正记录：${cue.code}`, renderHistoryHtml(cue, v));
+  } else if (corrBtn.dataset.act === 'open-skip') {
+    openSkipForm(cue, v);
   } else {
     openCorrectForm(cue, v);
+  }
+});
+
+// ---------- 舞监：跳过依赖链（填原因 → 预览影响 → 确认整链跳过） ----------
+
+let skipPreview = null;
+
+function chainItemRowHtml(it) {
+  let state;
+  if (it.alreadySkipped) {
+    state = `<span class="badge skipped">已跳过</span>
+      <div class="muted">${esc(it.skip?.skippedBy || '')} ${esc(it.skip?.skippedAt || '')}<br>${esc(it.skip?.reason || '')}</div>`;
+  } else if (it.actualStartText || it.actualEndText) {
+    state = `<span class="badge done">阻断：已执行</span>
+      <div class="muted">开始 ${it.actualStartText ?? '—'}｜完成 ${it.actualEndText ?? '—'}</div>`;
+  } else {
+    state = `<span class="badge pending">将新跳过 v${it.rowVer}</span>`;
+  }
+  return `<tr class="${it.alreadySkipped ? 'skip-row-done' : (it.actualStartText || it.actualEndText ? 'skip-row-block' : 'skip-row-new')}">
+    <td>${it.isRoot ? '<strong>① 起点</strong>' : ''}</td>
+    <td><strong>${esc(it.code)}</strong></td>
+    <td>${esc(it.title || '')}</td>
+    <td>${esc(it.position)}</td>
+    <td class="mono">${it.plannedStartText} - ${it.plannedEndText}</td>
+    <td class="mono">${it.actualStartText ?? '—'} / ${it.actualEndText ?? '—'} / ${it.estimatedEndText ?? '—'}</td>
+    <td>${state}</td>
+  </tr>`;
+}
+
+function renderSkipPreviewHtml(p) {
+  const head = `<div class="muted">
+    第 ${p.versionNo} 版 · 起点 <strong>${esc(p.rootCode)}</strong>（#${p.rootCueRef}）：
+    沿前置关系可达 <strong>${p.totalCount}</strong> 项（含起点），其中
+    <strong>${p.newSkipCount}</strong> 项将新跳过、${p.alreadySkippedCount} 项已跳过（只展示、不重复留痕）。
+  </div>`;
+  const blocked = p.blocked && p.blockers.length
+    ? `<div class="conflict-banner"><strong>⚠ 存在 ${p.blockers.length} 个阻断项，整次将被拒绝、不留部分标记：</strong>
+        <ul>${p.blockers.map((b) => `<li>${esc(b.code || ('#' + b.cueRef))}：${esc(b.reason)}</li>`).join('')}</ul></div>`
+    : '';
+  return head + blocked + `
+    <div class="table-wrap skip-chain-wrap">
+      <table>
+        <thead><tr><th></th><th>编号</th><th>说明</th><th>岗位</th><th>计划时段</th><th>实际开始/完成/预计</th><th>预览结果</th></tr></thead>
+        <tbody>${p.chain.map(chainItemRowHtml).join('')}</tbody>
+      </table>
+    </div>
+    <div class="muted">确认后：首次跳过清除各项<strong>预计结束</strong>（已发布计划保留），记录操作者、时间与原因；
+      执行账号不得再登记，舞监不得更正其时间；跳过项不计入待执行时段与岗位冲突，其他项按现有规则重算。</div>`;
+}
+
+function openSkipForm(cue, v) {
+  skipPreview = null;
+  openModal(`跳过依赖链：${cue.code}`, `
+    <form id="skip-form" class="cue-form" data-cue-id="${cue.id}">
+      <div class="muted">
+        第 ${v.versionNo} 版 · <strong>${esc(cue.code)}</strong> ${esc(cue.title)}（${esc(cue.position)}）。
+        将预览该项<strong>及沿前置关系可达的全部后继</strong>；链中任一项已有实际开始/完成（或确认时登记行版本变化）将整体拒绝。
+      </div>
+      <label>跳过原因（必填）
+        <textarea name="reason" id="skip-reason" rows="2" maxlength="200" required placeholder="如：设备故障无法执行该提示项，后续灯光链整体取消"></textarea>
+      </label>
+      <div class="form-actions">
+        <button type="button" class="primary" id="skip-preview-btn">预览影响</button>
+      </div>
+      <div id="skip-preview-box"></div>
+      <div id="skip-err" class="error-text" hidden></div>
+      <div class="form-actions" id="skip-confirm-row" hidden>
+        <button type="submit" class="danger" id="skip-confirm-btn">确认跳过整链</button>
+        <button type="button" class="ghost" id="skip-cancel">取消</button>
+      </div>
+    </form>`);
+  $('#skip-cancel').addEventListener('click', closeModal);
+
+  $('#skip-preview-btn').addEventListener('click', async () => {
+    const reason = $('#skip-reason').value.trim();
+    if (!reason) {
+      const errBox = $('#skip-err');
+      errBox.textContent = '请先填写非空跳过原因';
+      errBox.hidden = false;
+      return;
+    }
+    $('#skip-err').hidden = true;
+    const btn = $('#skip-preview-btn');
+    btn.disabled = true;
+    btn.textContent = '预览中…';
+    try {
+      skipPreview = await api('POST', '/api/skips/preview', { versionId: v.id, cueRef: cue.id });
+      $('#skip-preview-box').innerHTML = renderSkipPreviewHtml(skipPreview);
+      // 有阻断项时不给确认入口（确认接口同样会整体拒绝）
+      $('#skip-confirm-row').hidden = skipPreview.blocked;
+      btn.textContent = '重新预览';
+    } catch (e) {
+      $('#skip-preview-box').innerHTML = `<div class="conflict-banner">${esc(e.message)}</div>`;
+      $('#skip-confirm-row').hidden = true;
+      btn.textContent = '重新预览';
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+$('#modal-overlay').addEventListener('submit', async (ev) => {
+  const form = ev.target.closest('#skip-form');
+  if (!form) return;
+  ev.preventDefault();
+  const v = state.live;
+  const cueId = Number(form.dataset.cueId);
+  const reason = $('#skip-reason').value.trim();
+  const errBox = $('#skip-err');
+  errBox.hidden = true;
+  if (!reason) {
+    errBox.textContent = '请填写非空跳过原因';
+    errBox.hidden = false;
+    return;
+  }
+  if (!skipPreview || skipPreview.versionId !== v.id || skipPreview.rootCueRef !== cueId) {
+    errBox.textContent = '请先点击「预览影响」并基于最新预览确认';
+    errBox.hidden = false;
+    return;
+  }
+  const items = skipPreview.chain
+    .filter((it) => !it.alreadySkipped)
+    .map((it) => ({ cueRef: it.cueRef, rowVersion: it.rowVersion }));
+  const btn = $('#skip-confirm-btn');
+  btn.disabled = true;
+  try {
+    const data = await api('POST', '/api/skips', { versionId: v.id, cueRef: cueId, reason, items });
+    state.live = data.version;
+    closeModal();
+    const conflictN = data.version.conflicts.length;
+    alertBar(conflictN ? 'error' : 'ok',
+      `已将「${data.skip.rootCode}」依赖链 ${data.skip.skippedCount} 项标记跳过（${data.skip.skippedBy} · ${data.skip.skippedAt}），预计结束已清除、计划保留。`
+      + (conflictN ? ` 当前仍有 ${conflictN} 项岗位冲突，请查看红色提示。` : ''),
+      conflictN ? 10000 : 6000);
+    renderLive();
+  } catch (e) {
+    btn.disabled = false;
+    if (e.status === 409) {
+      // 阻断 / 版本变化：在弹窗内列出阻断项，并要求重新预览；不关闭弹窗
+      const box = $('#skip-preview-box');
+      if (box && e.data?.items?.length) {
+        box.insertAdjacentHTML('afterbegin',
+          `<div class="conflict-banner"><strong>${esc(e.message)}</strong><ul>${
+            e.data.items.map((it) => `<li>${esc(it.code || ('#' + it.cueRef))}：${esc(it.reason)}</li>`).join('')}</ul></div>`);
+      } else {
+        errBox.textContent = e.message;
+        errBox.hidden = false;
+      }
+      skipPreview = null;
+      $('#skip-confirm-row').hidden = true;
+    } else {
+      errBox.textContent = e.message;
+      errBox.hidden = false;
+    }
   }
 });
 
@@ -943,14 +1127,14 @@ function renderDetail() {
     ${deputyHtml}
     <div class="panel"><div class="table-wrap"><table>
       <thead><tr><th>编号</th><th>说明</th><th>岗位</th><th>计划</th><th>重算开始</th><th>重算结束</th><th>状态</th><th>实际开始</th><th>实际完成</th><th>预计结束</th><th>登记人/时间</th>${state.me?.role === 'sm' ? '<th>更正</th>' : ''}</tr></thead>
-      <tbody>${v.cues.map((c) => `<tr>
+      <tbody>${v.cues.map((c) => `<tr class="${c.status === 'SKIPPED' ? 'skipped-row' : ''}">
         <td><strong>${esc(c.code)}</strong></td>
         <td>${esc(c.title)}</td>
         <td>${esc(c.position)}</td>
         <td class="mono">${c.plannedStartText} - ${minText(c.plannedStart + c.duration)}</td>
         <td class="mono">${c.schedStartText}${c.delayed ? '<div class="delayed">顺延</div>' : ''}</td>
         <td class="mono">${c.schedEndText}</td>
-        <td>${statusBadge(c.status)}</td>
+        <td>${statusBadge(c.status)}${skipTag(c)}</td>
         <td class="mono">${c.actualStartText ?? '—'}${handoverTag(c)}</td>
         <td class="mono">${c.actualEndText ?? '—'}</td>
         <td class="mono">${c.estimatedEndText ?? '—'}</td>
